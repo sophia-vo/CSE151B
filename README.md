@@ -1,197 +1,218 @@
-# CSE 151B Competition — Starter Code
+# CSE 151B Competition
 
-Open **`starter_code_cse151b_comp.ipynb`** to get started.
-
-The notebook covers environment setup, inference with Qwen3-4B-Thinking (INT8), and scoring against the public dataset.
+Final code submission for the CSE 151B Kaggle competition.
 
 ## Contents
 
-| File | Description |
-|---|---|
-| `starter_code_cse151b_comp.ipynb` | Main entry point |
-| `judger.py` | Response scoring logic |
-| `utils.py` | Utilities used by `judger.py` |
-| `data/public.jsonl` | Public dataset with ground-truth answers |
-| `results/` | Output JSONL files written at runtime |
+| File / Directory               | Description                                                                                            |
+| ------------------------------ | ------------------------------------------------------------------------------------------------------ |
+| `script.py`                     | Main inference script. Defines `run_inference()` and runs the full prediction pipeline.                |
+| `data/private.jsonl`           | Private evaluation dataset. Place the private dataset here before running inference.                   |
+| `results/`                     | Output directory created by the script. Contains intermediate pass CSVs and the final submission file. |
+| `results/submission_final.csv` | Final CSV produced by `run_inference()`.                                                               |
+| `README.md`                    | Setup, model, and reproduction instructions.                                                           |
 
-# vLLM Metal Quick Start Guide
+## Model
 
-## 1. Start a new terminal
+This submission uses the base model:
 
-Activate the `vllm-metal` environment:
+```text
+Qwen/Qwen3-4B-Thinking-2507
+```
+
+No fine-tuned checkpoint is required for this version. The model is downloaded automatically by vLLM from Hugging Face when the vLLM server starts.
+
+## Hardware Used
+
+GPU / accelerator used:
+
+```text
+Apple M4 Pro via Metal / vLLM Metal
+```
+
+Approximate total generation / inference time:
+
+```text
+Approximately 60 hours for the full private set.
+```
+
+## Python Environment
+
+The code expects a Python environment with vLLM Metal, OpenAI client compatibility, and tqdm installed.
+
+Required Python packages include:
+
+```bash
+pip install openai tqdm huggingface_hub
+```
+
+The vLLM Metal environment used for generation was:
 
 ```bash
 source ~/.venv-vllm-metal/bin/activate
-````
+```
 
-## 2. Add your Hugging Face token
+## Hugging Face Authentication
 
-Replace `hf_your_token_here` with your actual token:
+Add a Hugging Face token before starting vLLM if the model download requires authentication or if the model is not already cached:
 
 ```bash
 export HF_TOKEN="hf_your_token_here"
 ```
 
-## 3. Configure vLLM Metal
+## Dataset Setup
 
-Use these settings for Apple Silicon / Mac:
+Place the private dataset at:
 
-```bash
-export VLLM_METAL_USE_MLX=1
-export VLLM_MLX_DEVICE=gpu
-export VLLM_METAL_USE_PAGED_ATTENTION=1
-export VLLM_METAL_MEMORY_FRACTION=0.75
+```text
+data/private.jsonl
 ```
 
-## 4. Start the vLLM server
+The inference script expects this exact path:
 
-Recommended stable config:
+```python
+DATA_PATH = "data/private.jsonl"
+```
+
+## vLLM Metal Server Setup
+
+Start the vLLM server before running inference.
+
+Use the following settings for Apple Silicon / Mac:
 
 ```bash
+source ~/.venv-vllm-metal/bin/activate
+
+export HF_TOKEN="hf_your_token_here"
+
+VLLM_METAL_MEMORY_FRACTION=0.88 \
+VLLM_METAL_USE_PAGED_ATTENTION=1 \
+VLLM_METAL_PREFIX_CACHE=1 \
+VLLM_METAL_PREFIX_CACHE_FRACTION=0.03 \
 vllm serve Qwen/Qwen3-4B-Thinking-2507 \
-  --dtype auto \
+  --dtype bfloat16 \
   --trust-remote-code \
   --max-model-len 16384 \
-  --max-num-seqs 4 \
+  --max-num-seqs 8 \
   --max-num-batched-tokens 8192 \
-  --no-enable-prefix-caching
+  --enable-chunked-prefill \
+  --enable-prefix-caching
 ```
 
-Leave this terminal running.
+Leave this terminal running. The inference code connects to:
 
-You should see something like:
+```text
+http://localhost:8000/v1
+```
+
+You should see:
 
 ```text
 Application startup complete.
 ```
 
-## 5. Test the server from a second terminal
-
-```bash
-curl http://localhost:8000/v1/models
-```
-
-Then test generation:
-
-```bash
-curl http://localhost:8000/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "Qwen/Qwen3-4B-Thinking-2507",
-    "messages": [
-      {"role": "user", "content": "Answer in one sentence: what is 2+2?"}
-    ],
-    "max_tokens": 64,
-    "temperature": 0
-  }'
-```
-
-## 6. Run from Python
-
-Install the OpenAI client if needed:
-
-```bash
-pip install openai
-```
-
-Python example:
-
-```python
-from openai import OpenAI
-
-MODEL_ID = "Qwen/Qwen3-4B-Thinking-2507"
-
-client = OpenAI(
-    base_url="http://localhost:8000/v1",
-    api_key="EMPTY",
-    timeout=600,
-)
-
-result = client.chat.completions.create(
-    model=MODEL_ID,
-    messages=[
-        {"role": "system", "content": "You are an expert mathematician."},
-        {"role": "user", "content": "What is 2 + 2? Put the answer in \\boxed{}."},
-    ],
-    max_tokens=4096,
-    temperature=0.2,
-    top_p=0.95,
-    presence_penalty=0.0,
-    extra_body={
-        "top_k": 20,
-        "min_p": 0.0,
-        "repetition_penalty": 1.0,
-    },
-)
-
-print(result.choices[0].message.content)
-```
-
-## 7. Important token rule
-
-Do not set:
-
-```python
-max_tokens = 16384
-```
-
-when the server uses:
-
-```bash
---max-model-len 16384
-```
-
-The total must fit:
-
-```text
-prompt tokens + output tokens <= max model length
-```
-
-Recommended:
-
-```python
-max_tokens = 4096
-```
-
-Use `8192` only if responses are being cut off.
-
-## 8. Stop the server
-
-In the server terminal, press:
+To stop the server, press:
 
 ```bash
 Control + C
 ```
 
-If it does not stop, find the process:
+## Running Inference
+
+In a second terminal, activate the same environment:
 
 ```bash
-lsof -i :8000
+source ~/.venv-vllm-metal/bin/activate
 ```
 
-Then kill the PID:
+Then run:
 
 ```bash
-kill <PID>
+python script.py
 ```
 
-Force kill if needed:
+This calls `run_inference()` and produces:
+
+```text
+results/submission_final.csv
+```
+
+## Inference Pipeline
+
+`run_inference()` performs the full end-to-end pipeline:
+
+1. Loads the private dataset from `data/private.jsonl`.
+2. Sends each problem to the local vLLM OpenAI-compatible server.
+3. Uses different prompts for multiple-choice and non-multiple-choice questions.
+4. Generates initial answers with the base Qwen model.
+5. Retries responses that do not contain a valid `\boxed{}` answer after `</think>`.
+6. Applies answer extraction and validity checks.
+7. Writes intermediate CSVs after each pass.
+8. Writes the final submission CSV to `results/submission_final.csv`.
+
+## Final Hyperparameters
+
+The final inference hyperparameters are stored directly in `script.py`.
+
+### Pass 0
+
+```python
+max_tokens = 4096
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+repetition_penalty = 1.00
+prompt_style = "normal"
+```
+
+### Pass 1
+
+```python
+max_tokens = 8192
+temperature = 0.6
+top_p = 0.95
+top_k = 20
+repetition_penalty = 1.00
+prompt_style = "normal"
+```
+
+### Pass 2
+
+```python
+max_tokens = 12288
+temperature = 0.35
+top_p = 0.90
+top_k = 10
+repetition_penalty = 1.05
+prompt_style = "normal"
+```
+
+Other settings:
+
+```python
+CONCURRENCY = 8
+ITERATIONS = 2
+```
+
+## Output Format
+
+The final CSV has the columns:
+
+```text
+id,response
+```
+
+The final output file is:
+
+```text
+results/submission_final.csv
+```
+
+## Reproducibility Notes
+
+The code saves intermediate CSV files during generation so that interrupted runs can resume. For a completely fresh reproduction run, delete the `results/` directory before running:
 
 ```bash
-kill -9 <PID>
+rm -rf results
+python script.py
 ```
-
-## 9. Restart with a different config
-
-Stop the old server first, then rerun:
-
-```bash
-vllm serve Qwen/Qwen3-4B-Thinking-2507 \
-  --dtype auto \
-  --trust-remote-code \
-  --max-model-len 16384 \
-  --max-num-seqs 4 \
-  --max-num-batched-tokens 8192 \
-  --no-enable-prefix-caching
-```
-
