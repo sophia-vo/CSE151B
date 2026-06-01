@@ -44,6 +44,13 @@ ANSWER_FORMATTING_BLURB = (
     "Do not include explanations, units, or option text inside the box unless required."
 )
 
+DECIMAL_ROUNDING_BLURB = (
+    " If the final answer is a decimal and the problem statement does not "
+    "specify a rounding precision, round the final answer to 6 decimal places. "
+    "If the problem statement specifies a number of decimal places, significant "
+    "figures, or another rounding rule, the problem statement takes priority."
+)
+
 SYSTEM_MATH_NORMAL = (
     "Solve the problem inside <think> tags. "
     "Do only the reasoning needed to determine the final answer. "
@@ -114,6 +121,7 @@ def build_prompt(
     question: str,
     options: Optional[list],
     prompt_style: str = "normal",
+    round_decimal_answer: bool = False,
 ) -> tuple[str, str]:
     if options:
         labels = [chr(65 + i) for i in range(len(options))]
@@ -131,6 +139,9 @@ def build_prompt(
         else:
             sys_p = SYSTEM_MCQ_NORMAL
 
+        if round_decimal_answer:
+            sys_p += DECIMAL_ROUNDING_BLURB
+
         return sys_p, f"{question}\n\nOptions:\n{opts_str}"
 
     if prompt_style == "decisive":
@@ -141,6 +152,9 @@ def build_prompt(
         sys_p = SYSTEM_MATH_ULTRA_SHORT
     else:
         sys_p = SYSTEM_MATH_NORMAL
+
+    if round_decimal_answer:
+        sys_p += DECIMAL_ROUNDING_BLURB
 
     return sys_p, question
 
@@ -254,6 +268,28 @@ def unscorable_ids(responses: dict[int, str]) -> list[int]:
     ]
 
 
+DECIMAL_NUMBER_RE = re.compile(
+    r"(?<![A-Za-z0-9])[-+]?(?:\d+\.\d*|\.\d+)(?:[eE][-+]?\d+)?(?![A-Za-z0-9])"
+)
+
+
+def answer_has_decimal(text: str) -> bool:
+    answer = judger_extract(text)
+    if not answer:
+        return False
+
+    # Match decimal numeric answers such as 0.25, .25, 3., or 1.2e-4.
+    return bool(DECIMAL_NUMBER_RE.search(answer.replace(",", "")))
+
+
+def decimal_answer_ids(responses: dict[int, str]) -> list[int]:
+    return [
+        item_id
+        for item_id, resp in responses.items()
+        if answer_has_decimal(resp)
+    ]
+
+
 # vLLM call helpers
 async def call_one(system: str, user: str, cfg: dict, item_id: int | None = None) -> str:
     messages = [
@@ -311,6 +347,7 @@ async def run_items(
                 question=item["question"],
                 options=item.get("options"),
                 prompt_style=cfg["prompt_style"],
+                round_decimal_answer=cfg.get("round_decimal_answer", False),
             )
 
             response = await call_one(
@@ -408,6 +445,7 @@ async def _run_inference_async() -> None:
             "top_k": 20,
             "repetition_penalty": 1.00,
             "prompt_style": "normal",
+            "round_decimal_answer": False,
         },
 
         # Pass 1: same solving style as pass 0, but with a larger output budget.
@@ -419,6 +457,7 @@ async def _run_inference_async() -> None:
             "top_k": 20,
             "repetition_penalty": 1.00,
             "prompt_style": "normal",
+            "round_decimal_answer": False,
         },
 
         # Pass 2: one more larger-window retry for anything still lacking a valid box.
@@ -430,6 +469,20 @@ async def _run_inference_async() -> None:
             "top_k": 10,
             "repetition_penalty": 1.05,
             "prompt_style": "normal",
+            "round_decimal_answer": False,
+        },
+
+        # Pass 3: same generation settings and prompt style as pass 2, but with
+        # an added rounding instruction. Only run on rows whose parsed answer
+        # currently contains a decimal.
+        {
+            "max_tokens": MAX_TOKENS_PASS2,
+            "temperature": 0.35,
+            "top_p": 0.90,
+            "top_k": 10,
+            "repetition_penalty": 1.05,
+            "prompt_style": "normal",
+            "round_decimal_answer": True,
         },
     ]
 
@@ -558,6 +611,80 @@ async def _run_inference_async() -> None:
         if bad[:20]:
             suffix = "..." if len(bad) > 20 else ""
             print(f"  Remaining IDs: {bad[:20]}{suffix}")
+
+    # Decimal rounding pass: after pass 2, rerun any row whose parsed answer
+    # contains a decimal. This uses pass-2 generation settings plus an instruction
+    # to round to 6 decimal places unless the problem statement says otherwise.
+    decimal_ids = decimal_answer_ids(master)
+    decimal_pass_num = ITERATIONS + 1
+
+    if decimal_ids:
+        cfg = pass_configs[3]
+        pass_path = RESULTS_DIR / f"submission_pass{decimal_pass_num}_round6.csv"
+
+        print(f"\n{'=' * 60}")
+        print(f"Pass {decimal_pass_num} decimal rounding — {len(decimal_ids)} IDs to retry")
+        print(f"cfg = {cfg}")
+        print(f"Concurrency = {CONCURRENCY}")
+        print(f"{'=' * 60}")
+
+        if pass_path.exists():
+            print(f"  Exists, loading {pass_path}")
+            rows = load_csv(pass_path)
+        else:
+            rows = {}
+
+        def maybe_accept_decimal_result(item_id: int, response: str) -> None:
+            old = master.get(item_id, "")
+
+            if has_boxed_after_think(response):
+                master[item_id] = response
+                write_csv_atomic(final_path, master)
+            elif has_valid_answer(response) and not has_boxed_after_think(old):
+                master[item_id] = response
+                write_csv_atomic(final_path, master)
+            elif not old:
+                master[item_id] = response
+                write_csv_atomic(final_path, master)
+
+        missing_decimal_ids = [item_id for item_id in decimal_ids if item_id not in rows]
+
+        if missing_decimal_ids:
+            decimal_items = [by_id[item_id] for item_id in missing_decimal_ids]
+            rows = await run_items(
+                decimal_items,
+                cfg,
+                f"Pass {decimal_pass_num} round6",
+                csv_path=pass_path,
+                existing_rows=rows,
+                on_result=maybe_accept_decimal_result,
+            )
+            save_csv(pass_path, rows)
+        else:
+            print("  Decimal rounding pass CSV complete — no missing rows")
+
+        for item_id in decimal_ids:
+            response = rows.get(item_id)
+            if response is None:
+                continue
+
+            old = master.get(item_id, "")
+
+            if has_boxed_after_think(response):
+                master[item_id] = response
+            elif has_valid_answer(response) and not has_boxed_after_think(old):
+                master[item_id] = response
+            elif not old:
+                master[item_id] = response
+
+        write_csv_atomic(final_path, master)
+
+        bad = invalid_ids(master)
+        no_score = unscorable_ids(master)
+
+        print(f"  After pass {decimal_pass_num}: {len(bad)} no \\boxed{{}} | {len(no_score)} truly unscorable")
+    else:
+        print("\nDecimal rounding pass skipped — no parsed decimal answers")
 
     # Final CSV
     save_csv(final_path, master)
